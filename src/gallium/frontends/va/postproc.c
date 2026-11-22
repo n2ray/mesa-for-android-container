@@ -565,7 +565,14 @@ vlVaHandleVAProcPipelineParameterBufferType(vlVaDriver *drv, vlVaContext *contex
     * and this internal VPP synchronization path. */
    if (vlVaSurfaceNoWait())
       sync_timeout = 0;
-   if (src_surface->is_prime_import) {
+   if (src_surface->is_prime_import && getenv("XDESK_VPP_WAIT")) {
+      /* Chrome can import the shared buffer before its first decode. Use
+       * the decoder fence current when VPP actually consumes this buffer. */
+      producer = src_surface->sync_surface;
+      if (!producer)
+         producer = surface_find_prime_producer_for_surface(drv, src_surface);
+      sync_timeout = 250000000;
+   } else if (src_surface->is_prime_import) {
       if (src_surface->sync_surface &&
           src_surface->prime_fence &&
           src_surface->sync_surface->fence == src_surface->prime_fence) {
