@@ -524,6 +524,7 @@ struct tva_plane_mapping {
 #endif
 
 struct tva_codec {
+    struct pipe_video_codec base; /* tva_codec() casts this member back to its owner */
 #ifndef _WIN32
     /* Reader-thread only. The mapping itself pins the dma-buf inode. */
     struct tva_plane_mapping mappings[32];
@@ -531,7 +532,6 @@ struct tva_codec {
     bool reuse_mappings, time_copies;
     uint64_t plane_count, map_hits, setup_ns, sync_ns, copy_ns, finish_ns;
 #endif
-    struct pipe_video_codec base;
 
     bool encoder;
     uint32_t encode_bitrate;
@@ -5206,11 +5206,11 @@ tva_pipe_create_video_codec(struct pipe_context *context,
     tva_dbg_seq++;
     if (!encoder) {
         TVA_TRACE("session create codec=%d %dx%d", codec_id, templat->width, templat->height);
-    #ifndef _WIN32
-    c->reuse_mappings = tva_option_enabled("XDESK_VA_REUSE_MAPS");
-    c->time_copies = tva_option_enabled("XDESK_VA_TIME_COPIES");
+#ifndef _WIN32
+        c->reuse_mappings = tva_option_enabled("XDESK_VA_REUSE_MAPS");
+        c->time_copies = tva_option_enabled("XDESK_VA_TIME_COPIES");
 #endif
-    c->sess = tva_session_create(&cfg, &err);
+        c->sess = tva_session_create(&cfg, &err);
         if (!c->sess) {
             debug_printf("tva: session create failed: %s\n",
                          err.msg[0] ? err.msg : "unknown error (set DMD_VA_LOG=1)");
