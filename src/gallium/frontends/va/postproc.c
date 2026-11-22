@@ -571,7 +571,10 @@ vlVaHandleVAProcPipelineParameterBufferType(vlVaDriver *drv, vlVaContext *contex
       producer = src_surface->sync_surface;
       if (!producer)
          producer = surface_find_prime_producer_for_surface(drv, src_surface);
-      sync_timeout = 250000000;
+      /* A delayed 4K frame can take over 600 ms to reach the reader.
+       * Chromium treats timeout here as a terminal decode error. */
+      if (!vlVaSurfaceNoWait())
+         sync_timeout = 1000000000;
    } else if (src_surface->is_prime_import) {
       if (src_surface->sync_surface &&
           src_surface->prime_fence &&

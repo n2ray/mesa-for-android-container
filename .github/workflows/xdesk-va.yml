@@ -1,0 +1,37 @@
+name: XDesk Ubuntu VA driver
+on:
+  push:
+    branches: [xdesk]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  driver:
+    if: github.repository == 'n2ray/mesa-for-android-container' && github.ref == 'refs/heads/xdesk'
+    runs-on: ubuntu-24.04-arm
+    steps:
+    - uses: actions/checkout@v7
+    - name: Build in Ubuntu 26.04 arm64
+      run: |
+        docker run --rm -v "$PWD:/src" -w /src ubuntu:26.04 sh -ec '
+          export DEBIAN_FRONTEND=noninteractive
+          sed -i "s/^Types: deb$/Types: deb deb-src/" /etc/apt/sources.list.d/ubuntu.sources
+          apt-get update
+          apt-get build-dep -y mesa
+          apt-get install -y git libxfixes-dev libarchive-dev glslang-tools libxcb-shm0-dev
+          meson setup out -Dplatforms=x11,wayland -Dgallium-drivers=freedreno,zink \
+            -Dfreedreno-kmds=kgsl -Dgallium-va=enabled -Dtermux-va-bridge=enabled \
+            -Dtermux-va-wayland-shim=enabled -Dvideo-codecs=all -Dvulkan-drivers= \
+            -Dllvm=disabled -Dbuildtype=release -Dglx=dri -Degl=disabled \
+            -Dgles1=disabled -Dgles2=disabled -Dopengl=true
+          target=src/gallium/targets/dri/libgallium-27.0.0-devel.so
+          ninja -C out "$target"
+          install -s -m 755 "out/$target" termuxva_drv_video.so
+          sha256sum termuxva_drv_video.so > termuxva_drv_video.so.sha256
+        '
+    - name: Publish pinned driver
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        tag=xdesk-$(git show -s --format=%cs)-${GITHUB_SHA:0:12}
+        gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" --notes "Ubuntu 26.04 arm64 VA driver" --latest=false termuxva_drv_video.so termuxva_drv_video.so.sha256
