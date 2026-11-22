@@ -513,7 +513,24 @@ struct tva_av1_frame {
     bool hidden_since_show_frame;
 };
 
+#ifndef _WIN32
+struct tva_plane_mapping {
+    dev_t dev;
+    ino_t ino;
+    off_t offset;
+    size_t len;
+    uint8_t *addr;
+};
+#endif
+
 struct tva_codec {
+#ifndef _WIN32
+    /* Reader-thread only. The mapping itself pins the dma-buf inode. */
+    struct tva_plane_mapping mappings[32];
+    unsigned next_mapping;
+    bool reuse_mappings, time_copies;
+    uint64_t plane_count, map_hits, setup_ns, sync_ns, copy_ns, finish_ns;
+#endif
     struct pipe_video_codec base;
 
     bool encoder;
@@ -1495,10 +1512,12 @@ tva_reader_copy_enabled(void)
  * output arrives, while the application-thread Gallium path remains available
  * as a fallback for drivers that cannot mmap an exported BO. */
 static bool
-tva_direct_copy_plane(struct pipe_screen *screen, struct pipe_resource *res,
+tva_direct_copy_plane(struct tva_codec *c, struct pipe_resource *res,
                       const uint8_t *data, unsigned w, unsigned h,
                       unsigned src_stride)
 {
+   struct pipe_screen *screen = c->pipe->screen;
+   uint64_t start = c->time_copies ? os_time_get_nano() : 0;
    if (!screen || !screen->resource_get_handle || !res || !data || !w || !h)
       return false;
 
@@ -1541,13 +1560,36 @@ tva_direct_copy_plane(struct pipe_screen *screen, struct pipe_resource *res,
    }
 
    const size_t map_len = (size_t)(delta + need);
-   uint8_t *map = mmap(NULL, map_len, PROT_READ | PROT_WRITE, MAP_SHARED,
-                       fd, (off_t)map_offset);
-   if (map == MAP_FAILED) {
-      close(fd);
-      return false;
+   struct stat st;
+   bool cacheable = c->reuse_mappings && map_len <= 9 * 1024 * 1024 &&
+                    fstat(fd, &st) == 0 && st.st_ino != 0;
+   uint8_t *map = MAP_FAILED;
+   if (cacheable) {
+      for (unsigned i = 0; i < ARRAY_SIZE(c->mappings); i++) {
+         const struct tva_plane_mapping *entry = &c->mappings[i];
+         if (entry->addr && entry->dev == st.st_dev && entry->ino == st.st_ino &&
+             entry->offset == (off_t)map_offset && entry->len == map_len) {
+            map = entry->addr;
+            c->map_hits++;
+            break;
+         }
+      }
    }
-
+   if (map == MAP_FAILED) {
+      map = mmap(NULL, map_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)map_offset);
+      if (map == MAP_FAILED) {
+         close(fd);
+         return false;
+      }
+      if (cacheable) {
+         struct tva_plane_mapping *entry = &c->mappings[c->next_mapping];
+         if (entry->addr)
+            munmap(entry->addr, entry->len);
+         *entry = (struct tva_plane_mapping){st.st_dev, st.st_ino, (off_t)map_offset, map_len, map};
+         c->next_mapping = (c->next_mapping + 1) % ARRAY_SIZE(c->mappings);
+      }
+   }
+   uint64_t mapped = c->time_copies ? os_time_get_nano() : 0;
    bool synced = false;
    struct dma_buf_sync sync = {
       .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE,
@@ -1560,8 +1602,9 @@ tva_direct_copy_plane(struct pipe_screen *screen, struct pipe_resource *res,
               fd, errno);
    }
 
+   uint64_t ready = c->time_copies ? os_time_get_nano() : 0;
    uint8_t *dst = map + delta;
-   if (dst_stride == src_stride) {
+   if (dst_stride == row_bytes && src_stride == row_bytes) {
       memcpy(dst, data, row_bytes * h);
    } else {
       for (unsigned y = 0; y < h; y++)
@@ -1569,14 +1612,27 @@ tva_direct_copy_plane(struct pipe_screen *screen, struct pipe_resource *res,
                 data + (size_t)y * src_stride, row_bytes);
    }
 
+   uint64_t copied = c->time_copies ? os_time_get_nano() : 0;
    if (synced) {
       sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE;
       if (ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync) < 0 && getenv("DMD_VA_LOG"))
          fprintf(stderr, "tva: direct dma-buf sync end failed fd=%d errno=%d\n",
                  fd, errno);
    }
-   munmap(map, map_len);
+   if (!cacheable)
+      munmap(map, map_len);
    close(fd);
+   if (c->time_copies) {
+      c->setup_ns += mapped - start;
+      c->sync_ns += ready - mapped;
+      c->copy_ns += copied - ready;
+      c->finish_ns += os_time_get_nano() - copied;
+      if (++c->plane_count % 240 == 0)
+         fprintf(stderr, "tva planes=%llu hits=%llu mean_us setup=%.1f sync=%.1f copy=%.1f finish=%.1f\n",
+                 (unsigned long long)c->plane_count, (unsigned long long)c->map_hits,
+                 c->setup_ns / (1000.0 * c->plane_count), c->sync_ns / (1000.0 * c->plane_count),
+                 c->copy_ns / (1000.0 * c->plane_count), c->finish_ns / (1000.0 * c->plane_count));
+   }
    return true;
 }
 
@@ -1649,11 +1705,10 @@ tva_copy_frame_direct(struct tva_codec *c, struct tva_pending *p,
    if (y_end > src_size || uv_end > src_size)
       return false;
 
-   struct pipe_screen *screen = c->pipe->screen;
-   if (!tva_direct_copy_plane(screen, p->resources[0], src + y_offset,
+   if (!tva_direct_copy_plane(c, p->resources[0], src + y_offset,
                                w, h, (unsigned)p->stride))
       return false;
-   if (!tva_direct_copy_plane(screen, p->resources[1], src + uv_offset,
+   if (!tva_direct_copy_plane(c, p->resources[1], src + uv_offset,
                               uv_w, uv_h, (unsigned)p->stride))
       return false;
    return true;
@@ -4948,6 +5003,11 @@ tva_codec_destroy(struct pipe_video_codec *codec)
     tva_session_cancel(c->sess);
     if (c->reader_started)
         thrd_join(c->reader, NULL);
+#ifndef _WIN32
+    for (unsigned i = 0; i < ARRAY_SIZE(c->mappings); i++)
+        if (c->mappings[i].addr)
+            munmap(c->mappings[i].addr, c->mappings[i].len);
+#endif
     mtx_lock(&c->pend_mutex);
     while (c->pend_count)
         tva_pend_pop_locked(c);
@@ -5146,7 +5206,11 @@ tva_pipe_create_video_codec(struct pipe_context *context,
     tva_dbg_seq++;
     if (!encoder) {
         TVA_TRACE("session create codec=%d %dx%d", codec_id, templat->width, templat->height);
-        c->sess = tva_session_create(&cfg, &err);
+    #ifndef _WIN32
+    c->reuse_mappings = tva_option_enabled("XDESK_VA_REUSE_MAPS");
+    c->time_copies = tva_option_enabled("XDESK_VA_TIME_COPIES");
+#endif
+    c->sess = tva_session_create(&cfg, &err);
         if (!c->sess) {
             debug_printf("tva: session create failed: %s\n",
                          err.msg[0] ? err.msg : "unknown error (set DMD_VA_LOG=1)");
