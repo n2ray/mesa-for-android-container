@@ -261,6 +261,13 @@ tva_encode_codec_id(enum pipe_video_profile profile)
     }
 }
 
+static bool
+tva_limit_chrome_av1(enum pipe_video_profile profile)
+{
+    return profile == PIPE_VIDEO_PROFILE_AV1_MAIN &&
+           tva_option_enabled("XDESK_AV1_LIMIT_1080");
+}
+
 static int
 tva_screen_get_video_param(struct pipe_screen *screen,
                            enum pipe_video_profile profile,
@@ -348,9 +355,9 @@ tva_screen_get_video_param(struct pipe_screen *screen,
         case PIPE_VIDEO_CAP_MIN_HEIGHT:
             return 96;
         case PIPE_VIDEO_CAP_MAX_WIDTH:
-            return 8192;
+            return tva_limit_chrome_av1(profile) ? 1920 : 8192;
         case PIPE_VIDEO_CAP_MAX_HEIGHT:
-            return 4320;
+            return tva_limit_chrome_av1(profile) ? 1080 : 4320;
         case PIPE_VIDEO_CAP_SUPPORTS_PROGRESSIVE:
             return 1;
         case PIPE_VIDEO_CAP_SKIP_CLEAR_SURFACE:
@@ -5088,6 +5095,10 @@ tva_pipe_create_video_codec(struct pipe_context *context,
                 templat->profile, templat->entrypoint);
         return NULL;   /* no encode / unsupported profiles through the bridge */
     }
+
+    if (!encoder && tva_limit_chrome_av1(templat->profile) &&
+        (templat->width > 1920 || templat->height > 1080))
+        return NULL;
 
     int codec_id = encoder ? tva_encode_codec_id(templat->profile)
                            : tva_codec_id(templat->profile);
