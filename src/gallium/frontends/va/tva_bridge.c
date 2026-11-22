@@ -513,24 +513,11 @@ struct tva_av1_frame {
     bool hidden_since_show_frame;
 };
 
-#ifndef _WIN32
-struct tva_plane_mapping {
-    dev_t dev;
-    ino_t ino;
-    off_t offset;
-    size_t len;
-    uint8_t *addr;
-};
-#endif
-
 struct tva_codec {
     struct pipe_video_codec base; /* tva_codec() casts this member back to its owner */
 #ifndef _WIN32
-    /* Reader-thread only. The mapping itself pins the dma-buf inode. */
-    struct tva_plane_mapping mappings[32];
-    unsigned next_mapping;
-    bool reuse_mappings, time_copies;
-    uint64_t plane_count, map_hits, setup_ns, sync_ns, copy_ns, finish_ns;
+    bool batch_writes, time_copies;
+    uint64_t plane_count, shared_writes, setup_ns, sync_ns, copy_ns, finish_ns;
 #endif
 
     bool encoder;
@@ -1507,6 +1494,22 @@ tva_reader_copy_enabled(void)
             !strcmp(e, "off"));
 }
 
+/* Both NV12 planes may refer to the same exported object. Keep the first
+ * successful START open until both writes finish, including on error. */
+struct tva_dma_write {
+   int fd;
+   dev_t dev;
+   ino_t ino;
+};
+
+static void
+tva_end_dma_write(int fd)
+{
+   struct dma_buf_sync sync = {.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE};
+   if (ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync) < 0 && getenv("DMD_VA_LOG"))
+      fprintf(stderr, "tva: direct dma-buf sync end failed fd=%d errno=%d\n", fd, errno);
+}
+
 /* Copy directly into a linear dma-buf without touching pipe_context.  The
  * reader thread can therefore complete a surface as soon as the daemon
  * output arrives, while the application-thread Gallium path remains available
@@ -1514,7 +1517,7 @@ tva_reader_copy_enabled(void)
 static bool
 tva_direct_copy_plane(struct tva_codec *c, struct pipe_resource *res,
                       const uint8_t *data, unsigned w, unsigned h,
-                      unsigned src_stride)
+                      unsigned src_stride, struct tva_dma_write *batch)
 {
    struct pipe_screen *screen = c->pipe->screen;
    uint64_t start = c->time_copies ? os_time_get_nano() : 0;
@@ -1560,41 +1563,23 @@ tva_direct_copy_plane(struct tva_codec *c, struct pipe_resource *res,
    }
 
    const size_t map_len = (size_t)(delta + need);
-   struct stat st;
-   bool cacheable = c->reuse_mappings && map_len <= 9 * 1024 * 1024 &&
-                    fstat(fd, &st) == 0 && st.st_ino != 0;
-   uint8_t *map = MAP_FAILED;
-   if (cacheable) {
-      for (unsigned i = 0; i < ARRAY_SIZE(c->mappings); i++) {
-         const struct tva_plane_mapping *entry = &c->mappings[i];
-         if (entry->addr && entry->dev == st.st_dev && entry->ino == st.st_ino &&
-             entry->offset == (off_t)map_offset && entry->len == map_len) {
-            map = entry->addr;
-            c->map_hits++;
-            break;
-         }
-      }
-   }
+   uint8_t *map = mmap(NULL, map_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)map_offset);
    if (map == MAP_FAILED) {
-      map = mmap(NULL, map_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)map_offset);
-      if (map == MAP_FAILED) {
-         close(fd);
-         return false;
-      }
-      if (cacheable) {
-         struct tva_plane_mapping *entry = &c->mappings[c->next_mapping];
-         if (entry->addr)
-            munmap(entry->addr, entry->len);
-         *entry = (struct tva_plane_mapping){st.st_dev, st.st_ino, (off_t)map_offset, map_len, map};
-         c->next_mapping = (c->next_mapping + 1) % ARRAY_SIZE(c->mappings);
-      }
+      close(fd);
+      return false;
    }
+   struct stat st;
+   bool identified = batch && fstat(fd, &st) == 0 && st.st_ino;
+   bool shared = identified && batch->fd >= 0 &&
+                 batch->dev == st.st_dev && batch->ino == st.st_ino;
    uint64_t mapped = c->time_copies ? os_time_get_nano() : 0;
    bool synced = false;
    struct dma_buf_sync sync = {
       .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE,
    };
-   if (ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync) == 0) {
+   if (shared) {
+      c->shared_writes++;
+   } else if (ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync) == 0) {
       synced = true;
    } else if (errno != ENOTTY && errno != EOPNOTSUPP && errno != ENOSYS &&
               getenv("DMD_VA_LOG")) {
@@ -1613,23 +1598,22 @@ tva_direct_copy_plane(struct tva_codec *c, struct pipe_resource *res,
    }
 
    uint64_t copied = c->time_copies ? os_time_get_nano() : 0;
-   if (synced) {
-      sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE;
-      if (ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync) < 0 && getenv("DMD_VA_LOG"))
-         fprintf(stderr, "tva: direct dma-buf sync end failed fd=%d errno=%d\n",
-                 fd, errno);
+   if (synced && identified && batch->fd < 0) {
+      *batch = (struct tva_dma_write){fd, st.st_dev, st.st_ino};
+   } else {
+      if (synced)
+         tva_end_dma_write(fd);
+      close(fd);
    }
-   if (!cacheable)
-      munmap(map, map_len);
-   close(fd);
+   munmap(map, map_len);
    if (c->time_copies) {
       c->setup_ns += mapped - start;
       c->sync_ns += ready - mapped;
       c->copy_ns += copied - ready;
       c->finish_ns += os_time_get_nano() - copied;
       if (++c->plane_count % 240 == 0)
-         fprintf(stderr, "tva planes=%llu hits=%llu mean_us setup=%.1f sync=%.1f copy=%.1f finish=%.1f\n",
-                 (unsigned long long)c->plane_count, (unsigned long long)c->map_hits,
+         fprintf(stderr, "tva planes=%llu shared=%llu mean_us setup=%.1f sync=%.1f copy=%.1f finish=%.1f\n",
+                 (unsigned long long)c->plane_count, (unsigned long long)c->shared_writes,
                  c->setup_ns / (1000.0 * c->plane_count), c->sync_ns / (1000.0 * c->plane_count),
                  c->copy_ns / (1000.0 * c->plane_count), c->finish_ns / (1000.0 * c->plane_count));
    }
@@ -1705,13 +1689,20 @@ tva_copy_frame_direct(struct tva_codec *c, struct tva_pending *p,
    if (y_end > src_size || uv_end > src_size)
       return false;
 
-   if (!tva_direct_copy_plane(c, p->resources[0], src + y_offset,
-                               w, h, (unsigned)p->stride))
-      return false;
-   if (!tva_direct_copy_plane(c, p->resources[1], src + uv_offset,
-                              uv_w, uv_h, (unsigned)p->stride))
-      return false;
-   return true;
+   struct tva_dma_write batch = {.fd = -1};
+   struct tva_dma_write *access = c->batch_writes ? &batch : NULL;
+   bool copied = tva_direct_copy_plane(c, p->resources[0], src + y_offset,
+                                       w, h, (unsigned)p->stride, access) &&
+                 tva_direct_copy_plane(c, p->resources[1], src + uv_offset,
+                                       uv_w, uv_h, (unsigned)p->stride, access);
+   if (batch.fd >= 0) {
+      uint64_t start = c->time_copies ? os_time_get_nano() : 0;
+      tva_end_dma_write(batch.fd);
+      close(batch.fd);
+      if (c->time_copies)
+         c->finish_ns += os_time_get_nano() - start;
+   }
+   return copied;
 }
 #endif
 
@@ -5003,11 +4994,6 @@ tva_codec_destroy(struct pipe_video_codec *codec)
     tva_session_cancel(c->sess);
     if (c->reader_started)
         thrd_join(c->reader, NULL);
-#ifndef _WIN32
-    for (unsigned i = 0; i < ARRAY_SIZE(c->mappings); i++)
-        if (c->mappings[i].addr)
-            munmap(c->mappings[i].addr, c->mappings[i].len);
-#endif
     mtx_lock(&c->pend_mutex);
     while (c->pend_count)
         tva_pend_pop_locked(c);
@@ -5207,7 +5193,7 @@ tva_pipe_create_video_codec(struct pipe_context *context,
     if (!encoder) {
         TVA_TRACE("session create codec=%d %dx%d", codec_id, templat->width, templat->height);
 #ifndef _WIN32
-        c->reuse_mappings = tva_option_enabled("XDESK_VA_REUSE_MAPS");
+        c->batch_writes = tva_option_enabled("XDESK_VA_BATCH_WRITE");
         c->time_copies = tva_option_enabled("XDESK_VA_TIME_COPIES");
 #endif
         c->sess = tva_session_create(&cfg, &err);
