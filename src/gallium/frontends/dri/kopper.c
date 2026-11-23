@@ -509,7 +509,10 @@ kopper_destroy_drawable(struct dri_drawable *drawable)
       VkXcbSurfaceCreateInfoKHR *xcb = (VkXcbSurfaceCreateInfoKHR *)&drawable->info.bos;
       xcb_connection_t *conn = xcb->connection;
       if (drawable->configure_event) {
-         xcb_present_select_input(conn, drawable->configure_eid, xcb->window, 0);
+         /* The owner can destroy the X window before the GLX drawable. */
+         xcb_void_cookie_t deselect = xcb_present_select_input_checked(
+            conn, drawable->configure_eid, xcb->window, 0);
+         xcb_discard_reply(conn, deselect.sequence);
          xcb_unregister_for_special_event(conn, drawable->configure_event);
          simple_mtx_destroy(&drawable->geometry_lock);
       }
@@ -533,6 +536,16 @@ kopperSwapBuffers(struct dri_drawable *drawable, uint32_t flush_flags, int nrect
    ptex = drawable->textures[ST_ATTACHMENT_BACK_LEFT];
    if (!ptex)
       return 0;
+
+#ifdef VK_USE_PLATFORM_XCB_KHR
+   /* Keep one server-ordered geometry observation per presented frame.
+    * Multiple GLX rebinds before the next swap can share that result. */
+   if (drawable->configure_event) {
+      simple_mtx_lock(&drawable->geometry_lock);
+      drawable->geometry_checked = 0;
+      simple_mtx_unlock(&drawable->geometry_lock);
+   }
+#endif
 
    /* ensure invalidation is applied before renderpass ends */
    if (flush_flags & __DRI2_FLUSH_INVALIDATE_ANCILLARY)
