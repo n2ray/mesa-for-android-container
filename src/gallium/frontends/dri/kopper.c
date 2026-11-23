@@ -28,6 +28,8 @@
 #include "util/u_inlines.h"
 #include "util/box.h"
 #include "util/log.h"
+#include "util/os_time.h"
+#include "util/u_debug.h"
 #include "pipe/p_context.h"
 #include "pipe-loader/pipe_loader.h"
 #include "state_tracker/st_context.h"
@@ -314,6 +316,59 @@ get_drawable_info(struct dri_drawable *drawable, int *w, int *h)
       loader->GetDrawableInfo(drawable, w, h, drawable->loaderPrivate);
 }
 
+#ifdef VK_USE_PLATFORM_XCB_KHR
+static void
+kopper_watch_geometry(struct dri_drawable *drawable, VkXcbSurfaceCreateInfoKHR *xcb)
+{
+   if (!drawable->is_window || drawable->screen->fd != -1 ||
+       !debug_get_bool_option("XDESK_KOPPER_CONFIGURE", true))
+      return;
+
+   drawable->configure_eid = xcb_generate_id(xcb->connection);
+   drawable->configure_event = xcb_register_for_special_xge(
+      xcb->connection, &xcb_present_id, drawable->configure_eid, NULL);
+   if (!drawable->configure_event)
+      return;
+
+   xcb_void_cookie_t select = xcb_present_select_input_checked(
+      xcb->connection, drawable->configure_eid, xcb->window,
+      XCB_PRESENT_EVENT_MASK_CONFIGURE_NOTIFY);
+   xcb_generic_error_t *error = xcb_request_check(xcb->connection, select);
+   if (error || xcb_connection_has_error(xcb->connection)) {
+      free(error);
+      xcb_unregister_for_special_event(xcb->connection, drawable->configure_event);
+      drawable->configure_event = NULL;
+      return;
+   }
+   simple_mtx_init(&drawable->geometry_lock, mtx_plain);
+}
+
+static void
+kopper_check_x11_size(struct dri_drawable *drawable, struct pipe_resource *ptex)
+{
+   VkXcbSurfaceCreateInfoKHR *xcb = (void *)&drawable->info.bos;
+   simple_mtx_lock(&drawable->geometry_lock);
+   xcb_generic_event_t *ev;
+   while ((ev = xcb_poll_for_special_event(xcb->connection, drawable->configure_event))) {
+      drawable->geometry_checked = 0;
+      free(ev);
+   }
+
+   /* Bound recovery from a missing notification. A real capabilities query
+    * is also required when the attachment disagrees with the known extent. */
+   int64_t now = os_time_get_nano();
+   if (!drawable->geometry_checked ||
+       now - drawable->geometry_checked >= 1000000000LL ||
+       ptex->width0 != drawable->w || ptex->height0 != drawable->h ||
+       xcb_connection_has_error(xcb->connection)) {
+      bool ok = zink_kopper_update(kopper_get_zink_screen(drawable->screen->base.screen),
+                                   ptex, &drawable->w, &drawable->h);
+      drawable->geometry_checked = ok ? now : 0;
+   }
+   simple_mtx_unlock(&drawable->geometry_lock);
+}
+#endif
+
 void
 kopper_update_drawable_info(struct dri_drawable *drawable)
 {
@@ -324,6 +379,12 @@ kopper_update_drawable_info(struct dri_drawable *drawable)
                                 drawable->textures[ST_ATTACHMENT_FRONT_LEFT];
 
    bool do_kopper_update = is_window && ptex && screen->fd == -1;
+#ifdef VK_USE_PLATFORM_XCB_KHR
+   if (do_kopper_update && drawable->configure_event) {
+      kopper_check_x11_size(drawable, ptex);
+      return;
+   }
+#endif
    if (drawable->info.bos.sType == VK_STRUCTURE_TYPE_XCB_SURFACE_CREATE_INFO_KHR && do_kopper_update)
       zink_kopper_update(kopper_get_zink_screen(screen->base.screen), ptex, &drawable->w, &drawable->h);
    else
@@ -435,6 +496,7 @@ kopper_init_drawable(struct dri_drawable *drawable, bool isPixmap, int alphaBits
       drawable->special_event =
          xcb_register_for_special_xge(conn, &xcb_present_id,
                                       drawable->present_eid, NULL);
+      kopper_watch_geometry(drawable, xcb);
    }
 #endif
 }
@@ -446,6 +508,11 @@ kopper_destroy_drawable(struct dri_drawable *drawable)
    if (drawable->info.bos.sType == VK_STRUCTURE_TYPE_XCB_SURFACE_CREATE_INFO_KHR) {
       VkXcbSurfaceCreateInfoKHR *xcb = (VkXcbSurfaceCreateInfoKHR *)&drawable->info.bos;
       xcb_connection_t *conn = xcb->connection;
+      if (drawable->configure_event) {
+         xcb_present_select_input(conn, drawable->configure_eid, xcb->window, 0);
+         xcb_unregister_for_special_event(conn, drawable->configure_event);
+         simple_mtx_destroy(&drawable->geometry_lock);
+      }
       xcb_unregister_for_special_event(conn, drawable->special_event);
    }
 

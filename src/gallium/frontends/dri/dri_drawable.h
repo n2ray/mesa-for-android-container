@@ -27,6 +27,7 @@
 
 #ifndef DRI_DRAWABLE_H
 #define DRI_DRAWABLE_H
+#include "util/simple_mtx.h"
 
 #include "util/compiler.h"
 #include "util/format/u_formats.h"
@@ -104,6 +105,11 @@ struct dri_drawable
 #ifdef VK_USE_PLATFORM_XCB_KHR
    xcb_special_event_t *special_event;
    uint32_t present_eid;
+   /* Separate from the MSC queue; it has different selection and consumers. */
+   xcb_special_event_t *configure_event;
+   uint32_t configure_eid;
+   int64_t geometry_checked;
+   simple_mtx_t geometry_lock;
 #endif
 };
 

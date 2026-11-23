@@ -1,0 +1,28 @@
+name: XDesk Kopper device-test build
+on:
+  push:
+    branches: [perf/kopper-x11-geometry]
+permissions:
+  contents: read
+jobs:
+  ubuntu-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Ubuntu arm64 Gallium for the XDesk device comparison
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src ubuntu:26.04 sh -ec '
+            export DEBIAN_FRONTEND=noninteractive
+            sed -i "s/^Types: deb$/Types: deb deb-src/" /etc/apt/sources.list.d/ubuntu.sources
+            apt-get -qq update
+            apt-get -y build-dep mesa
+            apt-get install -y git glslang-tools libxcb-shm0-dev libxfixes-dev
+            meson setup out -Dplatforms=x11,wayland -Dgallium-drivers=zink,freedreno -Dfreedreno-kmds=kgsl -Dvulkan-drivers= -Dgallium-va=disabled -Dllvm=disabled -Degl=enabled -Dglx=dri -Dglvnd=enabled -Dbuildtype=release
+            target=src/gallium/targets/dri/libgallium-27.0.0-devel.so
+            ninja -C out "$target"
+            install -s -m755 "out/$target" libgallium-27.0.0-devel.so
+          '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kopper-ubuntu-arm64
+          path: libgallium-27.0.0-devel.so
