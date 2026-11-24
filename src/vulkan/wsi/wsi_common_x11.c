@@ -1370,6 +1370,7 @@ struct x11_swapchain {
    struct wsi_image_timing_request              timing_request;
    bool                                         has_reliable_msc;
    bool                                         last_complete_is_flip;
+   bool                                         wait_for_flip_fence;
 
    struct x11_image                             images[0];
 };
@@ -2603,6 +2604,16 @@ x11_manage_present_queue(void *state)
             x11_needs_wait_for_fences(chain->base.wsi, wsi_conn, present_mode) &&
             !chain->base.image_info.explicit_sync;
 
+      /* A fullscreen X server that reads the dma-buf synchronously can
+       * stall its event loop until rendering finishes. Wait on the existing
+       * WSI worker only after a real pixmap completion confirmed a flip. */
+      if (chain->wait_for_flip_fence && !chain->base.image_info.explicit_sync &&
+          !wsi_conn->is_xwayland) {
+         mtx_lock(&chain->thread_state_lock);
+         need_fence_wait |= chain->last_complete_is_flip;
+         mtx_unlock(&chain->thread_state_lock);
+      }
+
       bool need_timing_fence_wait = x11_swapchain_present_timing_is_out_of_order_completion(
             chain, wsi_conn, &chain->images[image_index].timing_request);
 
@@ -3513,6 +3524,7 @@ x11_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    chain->base.set_timing_request = x11_set_timing_request;
    chain->base.poll_early_refresh = x11_poll_early_refresh;
    chain->base.present_mode = present_mode;
+   chain->wait_for_flip_fence = debug_get_bool_option("XDESK_WSI_WAIT_FLIP", false);
    chain->base.image_count = num_images;
 
    /* This is what Xserver is using. We cannot really query it, but we rely on it working. */
