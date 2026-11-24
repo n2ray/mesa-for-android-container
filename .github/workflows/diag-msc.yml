@@ -1,0 +1,41 @@
+name: Ubuntu Turnip device comparison
+on:
+  push:
+    branches: [diag/xdesk-kgsl-clock]
+permissions:
+  contents: read
+jobs:
+  drivers:
+    runs-on: ubuntu-24.04-arm
+    container: ubuntu:26.04
+    steps:
+      - name: Install Git before checkout
+        run: apt-get -qq update && apt-get -y install git ca-certificates
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 8
+      - name: Build matching stock and patched KGSL drivers
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+          apt-get -qq update
+          apt-get -y build-dep mesa
+          apt-get -y install git glslang-tools libxcb-shm0-dev libxfixes-dev
+          git config --global --add safe.directory "$PWD"
+          src=src/vulkan/wsi/wsi_common_x11.c
+          target=src/freedreno/vulkan/libvulkan_freedreno.so
+          cp "$src" /tmp/fixed.c
+          meson setup out -Dplatforms=x11,wayland -Dgallium-drivers=freedreno,zink -Dfreedreno-kmds=kgsl -Dvulkan-drivers=freedreno -Dllvm=disabled -Degl=enabled -Dglx=dri -Dbuildtype=release
+          for version in fixed; do
+            if [[ $version == fixed ]]; then cp /tmp/fixed.c "$src"; fi
+            ninja -C out "$target"
+            readelf -d "out/$target" | grep -F libxcb-dri3
+            mkdir -p "artifacts/$version"
+            install -s -m755 "out/$target" "artifacts/$version/libvulkan_freedreno.so"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: turnip-msc-comparison
+          path: artifacts
