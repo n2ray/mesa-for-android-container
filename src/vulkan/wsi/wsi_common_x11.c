@@ -1767,7 +1767,10 @@ x11_handle_dri3_present_event(struct x11_swapchain *chain,
       VkResult result = VK_SUCCESS;
 
       struct wsi_device *wsi_device = (struct wsi_device *)chain->base.wsi;
-      if (wsi_device->x11.ignore_suboptimal)
+      /* NotifyMSC completions report timing only. Their mode does not
+       * describe how a swapchain image was presented. */
+      if (complete->kind != XCB_PRESENT_COMPLETE_KIND_PIXMAP ||
+          wsi_device->x11.ignore_suboptimal)
          return result;
 
       switch (complete->mode) {
