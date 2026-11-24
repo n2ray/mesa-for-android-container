@@ -112,6 +112,7 @@ struct tu_physical_device
    int64_t master_major;
    int64_t master_minor;
 
+   bool kgsl_no_calibrated_clock;
    int kgsl_dma_fd;
    enum tu_kgsl_dma_type kgsl_dma_type;
 
